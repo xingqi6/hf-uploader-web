@@ -1,15 +1,12 @@
-name: Build and Push Docker Image
+name: Auto Build and Push
 
+# 🌟 核心修改 1: 只要推送到 main 分支，立即触发
 on:
-  # 触发条件1：推送 v* 标签时自动构建 (如 v34.0)
   push:
-    tags:
-      - 'v*'
-  # 触发条件2：允许在网页上手动点击 "Run workflow"
-  workflow_dispatch:
+    branches: [ "main" ]
+  workflow_dispatch: # 保留手动点击按钮的功能
 
 env:
-  # 镜像名称
   IMAGE_NAME: hf-uploader-web
 
 jobs:
@@ -23,22 +20,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 设置 QEMU (支持多架构构建)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 2. 设置 Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3. 登录 Docker Hub
+      # 登录 Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 4. 登录 GitHub Container Registry
+      # 登录 GitHub Packages (备用)
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -46,7 +41,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. 生成镜像标签 (核心修复部分)
+      # 🌟 核心修改 2: 自动生成标签逻辑
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -54,6 +49,20 @@ jobs:
           images: |
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # 这里定义了自动打标签的规则
           tags: |
-            # 规则1: 如果是 Git 标签推送 (如 v34.0)，使用该版本号作为 tag
-            type=ref,event=tag
+            # 规则A: 总是打上 'latest' 标签
+            type=raw,value=latest
+            # 规则B: 自动打上 'v1.0.构建次数' (例如 v1.0.45)
+            type=raw,value=v1.0.${{ github.run_number }}
+
+      # 构建并推送
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # 同时构建电脑版(amd64)和NAS版(arm64)
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
