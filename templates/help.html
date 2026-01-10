@@ -17,6 +17,7 @@
     <div class="tutorial-container">
         <div class="text-center mb-5">
             <h1 class="fw-bold">📖 HF Uploader 配置百科全书</h1>
+            <p class="text-muted">全网最全配置指南 · 包含各大邮箱授权码获取教程</p>
             <a href="/" class="btn btn-outline-primary">⬅️ 返回控制台</a>
         </div>
 
@@ -26,23 +27,49 @@
             <ol>
                 <li>登录 <a href="https://huggingface.co/settings/tokens" target="_blank">HF Token 设置页</a>。</li>
                 <li>点击 <b>Create new token</b> -> Type 选择 <span class="warn-text">Write (写入权限)</span>。</li>
+                <li>复制生成的以 <code>hf_</code> 开头的字符串。</li>
             </ol>
             <hr>
             <h5>2. 仓库 ID (必填)</h5>
-            <p>格式为 <code>用户名/仓库名</code>。</p>
+            <p>格式为 <code>用户名/仓库名</code>。例如：<span class="code-snippet">zgl668/music-data</span></p>
         </div>
 
         <h3 class="section-title">第二章：邮件通知配置</h3>
+        <div class="alert alert-warning">
+            <b>安全警告：</b> <b>“授权码/密码”一栏绝对不能填你的网页登录密码！</b> 必须使用生成的“专用密码”或“授权码”。
+        </div>
         <div class="step-box">
-            <p>获取 QQ 邮箱授权码（不是登录密码）：</p>
+            <h5>🐧 QQ 邮箱授权码获取步骤</h5>
             <ol>
-                <li>网页登录 QQ 邮箱 -> 设置 -> 账户。</li>
-                <li>开启 <b>SMTP</b> 服务 -> 生成授权码 (16位乱码)。</li>
+                <li>电脑登录 <a href="https://mail.qq.com" target="_blank">QQ 邮箱网页版</a>。</li>
+                <li>点击顶部 <b>设置</b> -> <b>账户</b>。</li>
+                <li>向下滚动找到 <b>POP3/IMAP/SMTP...服务</b>。</li>
+                <li>确保 <b>POP3/SMTP服务</b> 状态为“已开启”。</li>
+                <li>点击下方的 <b>“生成授权码”</b>，按提示发短信验证。</li>
+                <li>复制得到的 <b>16位英文乱码</b>，填入本工具的“授权码”框。</li>
             </ol>
         </div>
 
+        <h3 class="section-title">第三章：高级策略说明</h3>
+        <div class="step-box" style="border-left-color: #ffc107;">
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <h6>🐢 避障间隔 (秒)</h6>
+                    <p>每上传完一个文件，程序会“发呆”的时间。建议 <code>15-30</code> 秒。防止被封IP。</p>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <h6>⚡ 高速传输开关</h6>
+                    <p>使用 Rust 加速。速度快但极易报错 (MerkleDB Error)。<b>建议关闭，使用稳定模式。</b></p>
+                </div>
+                <div class="col-md-12">
+                    <h6 class="text-danger">🔥 阅后即焚 (谨慎开启)</h6>
+                    <p>开启后，文件一旦上传成功，NAS 里的原文件会<b>立即被物理删除</b>！适用于 NAS 空间紧张仅做中转的场景。</p>
+                </div>
+            </div>
+        </div>
+
         <div class="text-center mt-5">
-            <a href="/" class="btn btn-primary btn-lg px-5">返回控制台</a>
+            <a href="/" class="btn btn-primary btn-lg px-5">我已完全理解，返回配置</a>
         </div>
     </div>
 </body>
