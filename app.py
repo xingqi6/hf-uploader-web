@@ -1,4 +1,4 @@
-# app.py (V39.0 迅雷适配 & 完整性校验版)
+# app.py (V42.0 磐石·原子锁版)
 import os
 import sys
 import time
@@ -12,7 +12,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 from flask import Flask, render_template, request, jsonify, Response
-from huggingface_hub import HfApi, create_repo
+from huggingface_hub import HfApi
 
 # 强制 UTF-8
 sys.stdout.reconfigure(encoding='utf-8')
@@ -31,8 +31,11 @@ DEFAULT_CONFIG = {
     "hf_token": "", "repo_id": "", "repo_type": "dataset", "remote_folder": "",
     "email_host": "", "email_port": "", "email_user": "", "email_pass": "", "email_to": "",
     "warn_timeout": 900, "kill_timeout": 1800, "idle_interval": 1800,
-    "max_retries": 5, "notify_min_size": 1024, "file_interval": 15, "delete_after_upload": True,
-    "enable_hf_transfer": False 
+    "max_retries": 5, "notify_min_size": 1024, "file_interval": 15, 
+    "delete_after_upload": True,
+    "enable_hf_transfer": False,
+    "enable_idle_email": False,
+    "stability_duration": 60  # 🌟 新增：静止校验时长(秒)
 }
 
 uploader_thread = None
@@ -62,10 +65,7 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
-# 🌟 垃圾文件 + 临时下载文件黑名单
 JUNK_FILES = {'.DS_Store', 'Thumbs.db', 'desktop.ini', '@eaDir', '.smbdelete'}
-# 🌟 正在下载的文件后缀 (绝对不能传)
-TEMP_EXTENSIONS = ('.xltd', '.tmp', '.download', '.crdownload', '.bc!', '.cfg', '.td')
 
 def load_config():
     if not os.path.exists(CONFIG_FILE): return DEFAULT_CONFIG.copy()
@@ -73,7 +73,10 @@ def load_config():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             config = DEFAULT_CONFIG.copy()
+            # 补全配置
+            if "stability_duration" not in config: config["stability_duration"] = 60
             if "enable_hf_transfer" not in config: config["enable_hf_transfer"] = False
+            if "enable_idle_email" not in config: config["enable_idle_email"] = False
             config.update(data)
             return config
     except: return DEFAULT_CONFIG.copy()
@@ -130,8 +133,7 @@ def recursive_delete_empty(path):
         if path == DATA_DIR or not path.startswith(DATA_DIR): return
         if os.path.isdir(path):
             files = os.listdir(path)
-            # 这里的 valid 要排除 temp 文件，防止把正在下载的文件夹当成空的给删了
-            valid = [f for f in files if f not in JUNK_FILES and not f.startswith('.') and not f.lower().endswith(TEMP_EXTENSIONS)]
+            valid = [f for f in files if f not in JUNK_FILES and not f.startswith('.')]
             if not valid:
                 for f in files:
                     try:
@@ -146,33 +148,57 @@ def recursive_delete_empty(path):
 
 def check_remote_success(api, repo_id, repo_type, remote_path, local_size):
     try:
-        info = api.get_paths_info(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            paths=[remote_path],
-        )
+        info = api.get_paths_info(repo_id=repo_id, repo_type=repo_type, paths=[remote_path])
         if len(info) > 0:
-            remote_size = info[0].size
-            if remote_size == local_size:
-                return True
-    except:
-        return False
+            if info[0].size == local_size: return True
+    except: return False
     return False
 
-def ensure_repository(api, repo_id, repo_type):
+# 🌟 核心函数：文件夹稳定性校验 (原子锁)
+def check_folder_stability(folder_path, duration):
+    """
+    检查文件夹内所有文件在 duration 秒内是否发生变化。
+    返回: True(稳定), False(不稳定/正在写入)
+    """
+    logger.info(f"🛡️ [校验] 正在对 '{os.path.basename(folder_path)}' 进行 {duration}秒 静止测试...")
+    
+    snapshot1 = {}
     try:
-        api.repo_info(repo_id=repo_id, repo_type=repo_type)
-        logger.info(f"✅ 仓库检查: {repo_id} 已存在")
+        # 快照 1
+        for root, _, files in os.walk(folder_path):
+            for f in files:
+                p = os.path.join(root, f)
+                snapshot1[p] = {'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)}
+        
+        # 强制等待
+        time.sleep(duration)
+        
+        # 快照 2
+        snapshot2 = {}
+        for root, _, files in os.walk(folder_path):
+            for f in files:
+                p = os.path.join(root, f)
+                snapshot2[p] = {'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)}
+        
+        # 对比
+        # 1. 文件数量必须一致
+        if len(snapshot1) != len(snapshot2):
+            logger.info(f"⏳ [跳过] 文件数量发生变化，迅雷正在创建新文件")
+            return False
+        
+        # 2. 每个文件的大小和修改时间必须一致
+        for p, meta in snapshot1.items():
+            if p not in snapshot2: return False # 文件消失了
+            if meta['size'] != snapshot2[p]['size']:
+                logger.info(f"⏳ [跳过] 文件正在写入: {os.path.basename(p)}")
+                return False
+            if meta['mtime'] != snapshot2[p]['mtime']:
+                return False
+                
+        return True
     except Exception as e:
-        if "404" in str(e) or "not found" in str(e).lower():
-            logger.info(f"🛠️ 仓库不存在，自动创建: {repo_id}...")
-            try:
-                api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True, private=False)
-                logger.info(f"🎉 仓库创建成功！")
-            except Exception as create_err:
-                logger.error(f"❌ 创建失败: {create_err}")
-        else:
-            logger.warning(f"⚠️ 仓库检查异常: {e}")
+        logger.warning(f"⚠️ 校验出错(可能文件被占用): {e}")
+        return False
 
 def uploader_daemon(config):
     global is_running
@@ -186,14 +212,12 @@ def uploader_daemon(config):
     if use_accel:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     else:
-        if "HF_HUB_ENABLE_HF_TRANSFER" in os.environ:
-            del os.environ["HF_HUB_ENABLE_HF_TRANSFER"]
+        if "HF_HUB_ENABLE_HF_TRANSFER" in os.environ: del os.environ["HF_HUB_ENABLE_HF_TRANSFER"]
     
     try:
         api = HfApi(token=config['hf_token'], endpoint=endpoint)
         user = api.whoami()
         logger.info(f"✅ 登录成功: {user['name']}")
-        ensure_repository(api, config['repo_id'], config['repo_type'])
     except Exception as e:
         logger.error(f"❌ 登录失败: {str(e)}")
         is_running = False
@@ -217,13 +241,6 @@ def uploader_daemon(config):
                 for file in files:
                     if file.startswith('.') or file.endswith('.json'): continue
                     if file in JUNK_FILES: continue
-                    
-                    # 🌟 关键修改：遇到临时文件 (.xltd) 直接跳过，不加入任务列表
-                    if file.lower().endswith(TEMP_EXTENSIONS):
-                        # 只有在调试时才打印，避免刷屏
-                        # logger.info(f"⏳ [等待] 迅雷下载中: {file}") 
-                        continue
-
                     full = os.path.join(root, file)
                     rel = os.path.relpath(full, DATA_DIR).replace("\\", "/")
                     if rel not in uploaded_files:
@@ -238,12 +255,23 @@ def uploader_daemon(config):
                     if folder not in tasks_by_folder: tasks_by_folder[folder] = []
                     tasks_by_folder[folder].append((full, rel))
 
-                logger.info(f"📦 扫描完成: 发现 {len(all_files)} 个有效文件 (已过滤临时文件)")
+                logger.info(f"📦 扫描完成: 发现 {len(all_files)} 个待传文件")
                 failures_db = load_failures()
 
                 for folder_name, tasks in tasks_by_folder.items():
                     if stop_event.is_set(): break
-                    logger.info(f"📂 [目录] 处理中: {folder_name}")
+                    
+                    # 🌟 核心：文件夹级原子锁校验
+                    # 获取该文件夹的绝对路径 (取第一个文件的目录)
+                    folder_abs_path = os.path.dirname(tasks[0][0])
+                    stability_time = safe_int(config.get('stability_duration'), 60)
+                    
+                    # 对整个文件夹进行静止测试
+                    if not check_folder_stability(folder_abs_path, stability_time):
+                        logger.info(f"⏳ [等待] 文件夹 '{folder_name}' 不稳定(下载中)，跳过本轮...")
+                        continue # 跳过这个文件夹，处理下一个
+
+                    logger.info(f"🔒 [锁定] 文件夹 '{folder_name}' 校验通过，开始上传...")
                     folder_success_count = 0
                     tasks.sort(key=lambda x: x[1])
 
@@ -251,34 +279,12 @@ def uploader_daemon(config):
                         if stop_event.is_set(): break
                         
                         file_name = os.path.basename(rel_p)
-                        
-                        # 🌟 增强稳定性检查：不仅查大小，还要查锁定
-                        # 迅雷下载完刚改名时，文件可能还没完全释放。
-                        # 这里强制连续检查 3 次，每次间隔 2 秒，确保万无一失
-                        is_stable = True
-                        current_size = -1
-                        for _ in range(3):
-                            try:
-                                s = os.path.getsize(local_p)
-                                if current_size != -1 and s != current_size:
-                                    is_stable = False
-                                    break
-                                current_size = s
-                                time.sleep(2)
-                            except:
-                                is_stable = False
-                                break
-                        
-                        if not is_stable:
-                            logger.info(f"⏳ [跳过] 文件不稳定(可能刚下载完): {file_name}")
-                            continue
-
                         if i > 0: time.sleep(safe_int(config.get('file_interval'), 15))
 
                         remote_f = config.get('remote_folder', '')
                         if not remote_f or remote_f.strip() == "": remote_f = "."
                         remote_p = f"{remote_f}/{rel_p}" if remote_f != "." else rel_p
-                        size_mb = current_size / (1024*1024)
+                        size_mb = os.path.getsize(local_p) / (1024*1024)
 
                         logger.info(f"▶ [开始] 上传: {file_name} ({size_mb:.1f} MB)")
 
@@ -299,17 +305,16 @@ def uploader_daemon(config):
                                 break
                             except Exception as e:
                                 err_str = str(e)
-                                logger.info(f"⚠️ 发生错误，正在核实远程文件状态...")
-                                if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, current_size):
-                                    logger.info(f"🎉 [捡漏] 远程文件已存在且完整，视为成功！")
+                                logger.info(f"⚠️ 校验远程状态...")
+                                if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, os.path.getsize(local_p)):
+                                    logger.info(f"🎉 [捡漏] 远程文件已存在，视为成功！")
                                     success = True
                                     break
                                 
                                 backoff = 30 * (2 ** attempt)
-                                logger.warning(f"❌ [重试] 第{attempt+1}次失败，休息 {backoff}秒... 原因: {err_str[:50]}")
+                                logger.warning(f"❌ [重试] 第{attempt+1}次失败，休息 {backoff}秒...")
                                 time.sleep(backoff)
-                                
-                                if "401" in err_str or "403" in err_str:
+                                if "401" in err_str: 
                                     try: api = HfApi(token=config['hf_token'], endpoint=endpoint)
                                     except: pass
 
@@ -321,7 +326,6 @@ def uploader_daemon(config):
                             if rel_p in failures_db:
                                 del failures_db[rel_p]
                                 save_failures(failures_db)
-                                logger.info(f"🧹 [记录] 已清除历史报错")
 
                             folder_success_count += 1
                             
@@ -336,26 +340,18 @@ def uploader_daemon(config):
                                 except: pass
                         else:
                             logger.error(f"⛔ [失败] 放弃上传: {file_name}")
-                            
                             current_time = time.time()
                             if rel_p not in failures_db:
                                 failures_db[rel_p] = current_time
                                 save_failures(failures_db)
-                                logger.info(f"📝 [记录] 首次失败已记录")
                             else:
-                                first_fail_time = failures_db[rel_p]
-                                duration = current_time - first_fail_time
-                                if duration > 86400:
-                                    send_email(config, "严重：文件失败超24小时", f"文件卡死：\n{rel_p}")
-                                    failures_db[rel_p] = current_time 
+                                if (current_time - failures_db[rel_p]) > 86400:
+                                    send_email(config, "严重：文件失败超24小时", f"文件: {rel_p}")
+                                    failures_db[rel_p] = current_time
                                     save_failures(failures_db)
-                                    logger.info(f"🚨 [报警] 失败超24小时，已邮件通知")
-                                else:
-                                    hours = duration / 3600
-                                    logger.info(f"🔇 [静默] 已失败 {hours:.1f} 小时")
 
                     if folder_success_count > 0:
-                        status_text = "本地已清理" if config.get('delete_after_upload', True) else "文件保留"
+                        status_text = "本地已清理" if config.get('delete_after_upload', True) else "保留"
                         msg = f"目录：{folder_name}<br>成功：{folder_success_count} 个<br>状态：{status_text}"
                         send_email(config, "NAS文件夹任务完成", msg)
                         logger.info(f"🎉 [完成] 目录 {folder_name} 处理完毕")
@@ -370,7 +366,7 @@ def uploader_daemon(config):
                 if config.get('enable_idle_email', False):
                     if (now - last_busy) > safe_int(config.get('idle_interval'), 1800):
                         if (now - last_idle) > safe_int(config.get('idle_interval'), 1800):
-                            send_email(config, "空闲提醒", "NAS空闲中，等待新任务")
+                            send_email(config, "空闲提醒", "NAS空闲中")
                             last_idle = now
             
             for _ in range(5):
@@ -393,12 +389,11 @@ def help_page():
 
 @app.route('/save', methods=['POST'])
 def save_settings():
-    if is_running:
-        return jsonify({"status": "error", "msg": "🚫 请先【停止服务】再保存！"})
+    if is_running: return jsonify({"status": "error", "msg": "🚫 请先【停止服务】再保存！"})
     try:
         cfg = request.json
-        if not cfg.get('hf_token'): return jsonify({"status": "error", "msg": "❌ HF Token 不能为空"})
-        if not cfg.get('repo_id'): return jsonify({"status": "error", "msg": "❌ 仓库 ID 不能为空"})
+        if not cfg.get('hf_token'): return jsonify({"status": "error", "msg": "❌ Token 为空"})
+        if not cfg.get('repo_id'): return jsonify({"status": "error", "msg": "❌ 仓库ID 为空"})
 
         cfg['email_port'] = safe_int(cfg.get('email_port'), 465)
         cfg['warn_timeout'] = safe_int(cfg.get('warn_timeout'), 900)
@@ -407,42 +402,34 @@ def save_settings():
         cfg['max_retries'] = safe_int(cfg.get('max_retries'), 3)
         cfg['notify_min_size'] = safe_int(cfg.get('notify_min_size'), 1024)
         cfg['file_interval'] = safe_int(cfg.get('file_interval'), 15)
+        cfg['stability_duration'] = safe_int(cfg.get('stability_duration'), 60) # 新增参数
         
         cfg['hf_token'] = str(cfg['hf_token']).strip()
 
-        if save_config(cfg):
-            return jsonify({"status": "success", "msg": "✅ 配置已保存！请点击启动"})
-        else:
-            return jsonify({"status": "error", "msg": "❌ 写入失败"})
-    except Exception as e:
-        return jsonify({"status": "error", "msg": f"❌ 错误: {str(e)}"})
+        if save_config(cfg): return jsonify({"status": "success", "msg": "✅ 保存成功"})
+        else: return jsonify({"status": "error", "msg": "❌ 写入失败"})
+    except Exception as e: return jsonify({"status": "error", "msg": f"❌ 错误: {str(e)}"})
 
 @app.route('/reset', methods=['POST'])
 def reset_settings():
-    if is_running:
-        return jsonify({"status": "error", "msg": "🚫 运行中无法重置，请先停止！"})
+    if is_running: return jsonify({"status": "error", "msg": "🚫 运行中无法重置"})
     try:
-        if os.path.exists(CONFIG_FILE):
-            os.remove(CONFIG_FILE)
-        if os.path.exists(FAILURE_RECORD_FILE):
-            os.remove(FAILURE_RECORD_FILE)
-        return jsonify({"status": "success", "msg": "🗑️ 配置已清空！"})
-    except Exception as e:
-        return jsonify({"status": "error", "msg": f"❌ 重置失败: {str(e)}"})
+        if os.path.exists(CONFIG_FILE): os.remove(CONFIG_FILE)
+        if os.path.exists(FAILURE_RECORD_FILE): os.remove(FAILURE_RECORD_FILE)
+        return jsonify({"status": "success", "msg": "🗑️ 配置已清空"})
+    except Exception as e: return jsonify({"status": "error", "msg": f"❌ 错误: {str(e)}"})
 
 @app.route('/start', methods=['POST'])
 def start_worker():
     global uploader_thread, is_running, stop_event
-    if is_running:
-        return jsonify({"status": "warning", "msg": "⚠️ 服务已在运行"})
-    
+    if is_running: return jsonify({"status": "warning", "msg": "⚠️ 已在运行"})
     cfg = load_config()
     stop_event.clear()
     uploader_thread = threading.Thread(target=uploader_daemon, args=(cfg,))
     uploader_thread.daemon = True
     uploader_thread.start()
     is_running = True
-    return jsonify({"status": "success", "msg": "🚀 服务启动中..."})
+    return jsonify({"status": "success", "msg": "🚀 启动成功"})
 
 @app.route('/stop', methods=['POST'])
 def stop_worker():
