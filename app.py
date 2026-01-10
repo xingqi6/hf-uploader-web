@@ -1,4 +1,4 @@
-# app.py (V35.0 深度扫描 & 教程复原版)
+# app.py (V36.0 深度诊断 & 强制扫描版)
 import os
 import sys
 import time
@@ -161,12 +161,26 @@ def check_remote_success(api, repo_id, repo_type, remote_path, local_size):
 def uploader_daemon(config):
     global is_running
     endpoint = config.get('hf_endpoint', 'https://hf-mirror.com')
-    
-    # 🌟 速度模式控制
     use_accel = config.get('enable_hf_transfer', False)
-    mode_str = "🚀 高速模式 (hf_transfer)" if use_accel else "🐢 稳定模式 (HTTP)"
+    mode_str = "🚀 高速模式" if use_accel else "🐢 稳定模式 (HTTP)"
     
     logger.info(f"🚀 服务启动 | 目标: {endpoint} | {mode_str}")
+    
+    # 🌟 强制诊断：检查目录是否正确挂载
+    if not os.path.exists(DATA_DIR):
+        logger.error(f"❌ 严重错误：找不到 {DATA_DIR} 目录！Docker 挂载可能失效。")
+        is_running = False
+        return
+    
+    logger.info(f"🧐 [诊断] 正在检查挂载目录: {DATA_DIR}")
+    test_count = 0
+    for r, d, f in os.walk(DATA_DIR):
+        for file in f:
+            if file not in JUNK_FILES and not file.startswith('.'):
+                test_count += 1
+    logger.info(f"📊 [诊断] 当前目录下共有 {test_count} 个有效文件")
+    if test_count == 0:
+        logger.warning(f"⚠️ [警告] 目录为空！请检查您是否已将文件放入了正确的 NAS 文件夹。")
     
     os.environ["HF_ENDPOINT"] = endpoint
     if use_accel:
@@ -197,9 +211,6 @@ def uploader_daemon(config):
 
     while not stop_event.is_set():
         try:
-            # 🌟 增强扫描日志：打印正在扫描哪里
-            logger.debug(f"🔍 正在扫描: {DATA_DIR}...") 
-            
             all_files = []
             for root, dirs, files in os.walk(DATA_DIR):
                 for file in files:
@@ -232,14 +243,12 @@ def uploader_daemon(config):
                         if stop_event.is_set(): break
                         
                         file_name = os.path.basename(rel_p)
-                        # 检查文件是否还在写入
                         s1 = os.path.getsize(local_p)
                         time.sleep(2)
                         if os.path.getsize(local_p) != s1:
-                            logger.info(f"⏳ [跳过] 文件正在写入: {file_name}")
+                            logger.info(f"⏳ [跳过] 正在写入: {file_name}")
                             continue
 
-                        # 避障等待
                         if i > 0: time.sleep(safe_int(config.get('file_interval'), 15))
 
                         remote_f = config.get('remote_folder', '')
@@ -266,9 +275,7 @@ def uploader_daemon(config):
                                 break
                             except Exception as e:
                                 err_str = str(e)
-                                
-                                # 智能捡漏：报错后去查房
-                                logger.info(f"⚠️ 报错，核实远程文件...")
+                                logger.info(f"⚠️ 发生错误，正在核实远程文件状态...")
                                 if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, s1):
                                     logger.info(f"🎉 [捡漏] 远程文件已存在且完整，视为成功！")
                                     success = True
@@ -432,4 +439,4 @@ def stream_logs():
 if __name__ == '__main__':
     os.makedirs("/app/config", exist_ok=True)
     os.makedirs("/app/data", exist_ok=True)
-    app.run(host='0.0.0.0', port=7860, debug=False, use_reloader=False, threaded=True)
+    app.run(host='0.0.0.0', port=7860)
