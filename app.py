@@ -1,4 +1,4 @@
-# app.py (V36.0 深度诊断 & 强制扫描版)
+# app.py (V39.0 迅雷适配 & 完整性校验版)
 import os
 import sys
 import time
@@ -12,7 +12,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 from flask import Flask, render_template, request, jsonify, Response
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, create_repo
 
 # 强制 UTF-8
 sys.stdout.reconfigure(encoding='utf-8')
@@ -31,10 +31,8 @@ DEFAULT_CONFIG = {
     "hf_token": "", "repo_id": "", "repo_type": "dataset", "remote_folder": "",
     "email_host": "", "email_port": "", "email_user": "", "email_pass": "", "email_to": "",
     "warn_timeout": 900, "kill_timeout": 1800, "idle_interval": 1800,
-    "max_retries": 5, "notify_min_size": 1024, "file_interval": 15, 
-    "delete_after_upload": True,
-    "enable_hf_transfer": False,
-    "enable_idle_email": False
+    "max_retries": 5, "notify_min_size": 1024, "file_interval": 15, "delete_after_upload": True,
+    "enable_hf_transfer": False 
 }
 
 uploader_thread = None
@@ -64,7 +62,10 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
+# 🌟 垃圾文件 + 临时下载文件黑名单
 JUNK_FILES = {'.DS_Store', 'Thumbs.db', 'desktop.ini', '@eaDir', '.smbdelete'}
+# 🌟 正在下载的文件后缀 (绝对不能传)
+TEMP_EXTENSIONS = ('.xltd', '.tmp', '.download', '.crdownload', '.bc!', '.cfg', '.td')
 
 def load_config():
     if not os.path.exists(CONFIG_FILE): return DEFAULT_CONFIG.copy()
@@ -73,7 +74,6 @@ def load_config():
             data = json.load(f)
             config = DEFAULT_CONFIG.copy()
             if "enable_hf_transfer" not in config: config["enable_hf_transfer"] = False
-            if "enable_idle_email" not in config: config["enable_idle_email"] = False
             config.update(data)
             return config
     except: return DEFAULT_CONFIG.copy()
@@ -130,7 +130,8 @@ def recursive_delete_empty(path):
         if path == DATA_DIR or not path.startswith(DATA_DIR): return
         if os.path.isdir(path):
             files = os.listdir(path)
-            valid = [f for f in files if f not in JUNK_FILES and not f.startswith('.')]
+            # 这里的 valid 要排除 temp 文件，防止把正在下载的文件夹当成空的给删了
+            valid = [f for f in files if f not in JUNK_FILES and not f.startswith('.') and not f.lower().endswith(TEMP_EXTENSIONS)]
             if not valid:
                 for f in files:
                     try:
@@ -158,6 +159,21 @@ def check_remote_success(api, repo_id, repo_type, remote_path, local_size):
         return False
     return False
 
+def ensure_repository(api, repo_id, repo_type):
+    try:
+        api.repo_info(repo_id=repo_id, repo_type=repo_type)
+        logger.info(f"✅ 仓库检查: {repo_id} 已存在")
+    except Exception as e:
+        if "404" in str(e) or "not found" in str(e).lower():
+            logger.info(f"🛠️ 仓库不存在，自动创建: {repo_id}...")
+            try:
+                api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True, private=False)
+                logger.info(f"🎉 仓库创建成功！")
+            except Exception as create_err:
+                logger.error(f"❌ 创建失败: {create_err}")
+        else:
+            logger.warning(f"⚠️ 仓库检查异常: {e}")
+
 def uploader_daemon(config):
     global is_running
     endpoint = config.get('hf_endpoint', 'https://hf-mirror.com')
@@ -165,22 +181,6 @@ def uploader_daemon(config):
     mode_str = "🚀 高速模式" if use_accel else "🐢 稳定模式 (HTTP)"
     
     logger.info(f"🚀 服务启动 | 目标: {endpoint} | {mode_str}")
-    
-    # 🌟 强制诊断：检查目录是否正确挂载
-    if not os.path.exists(DATA_DIR):
-        logger.error(f"❌ 严重错误：找不到 {DATA_DIR} 目录！Docker 挂载可能失效。")
-        is_running = False
-        return
-    
-    logger.info(f"🧐 [诊断] 正在检查挂载目录: {DATA_DIR}")
-    test_count = 0
-    for r, d, f in os.walk(DATA_DIR):
-        for file in f:
-            if file not in JUNK_FILES and not file.startswith('.'):
-                test_count += 1
-    logger.info(f"📊 [诊断] 当前目录下共有 {test_count} 个有效文件")
-    if test_count == 0:
-        logger.warning(f"⚠️ [警告] 目录为空！请检查您是否已将文件放入了正确的 NAS 文件夹。")
     
     os.environ["HF_ENDPOINT"] = endpoint
     if use_accel:
@@ -193,6 +193,7 @@ def uploader_daemon(config):
         api = HfApi(token=config['hf_token'], endpoint=endpoint)
         user = api.whoami()
         logger.info(f"✅ 登录成功: {user['name']}")
+        ensure_repository(api, config['repo_id'], config['repo_type'])
     except Exception as e:
         logger.error(f"❌ 登录失败: {str(e)}")
         is_running = False
@@ -216,6 +217,13 @@ def uploader_daemon(config):
                 for file in files:
                     if file.startswith('.') or file.endswith('.json'): continue
                     if file in JUNK_FILES: continue
+                    
+                    # 🌟 关键修改：遇到临时文件 (.xltd) 直接跳过，不加入任务列表
+                    if file.lower().endswith(TEMP_EXTENSIONS):
+                        # 只有在调试时才打印，避免刷屏
+                        # logger.info(f"⏳ [等待] 迅雷下载中: {file}") 
+                        continue
+
                     full = os.path.join(root, file)
                     rel = os.path.relpath(full, DATA_DIR).replace("\\", "/")
                     if rel not in uploaded_files:
@@ -230,7 +238,7 @@ def uploader_daemon(config):
                     if folder not in tasks_by_folder: tasks_by_folder[folder] = []
                     tasks_by_folder[folder].append((full, rel))
 
-                logger.info(f"📦 扫描完成: 发现 {len(all_files)} 个新文件")
+                logger.info(f"📦 扫描完成: 发现 {len(all_files)} 个有效文件 (已过滤临时文件)")
                 failures_db = load_failures()
 
                 for folder_name, tasks in tasks_by_folder.items():
@@ -243,10 +251,26 @@ def uploader_daemon(config):
                         if stop_event.is_set(): break
                         
                         file_name = os.path.basename(rel_p)
-                        s1 = os.path.getsize(local_p)
-                        time.sleep(2)
-                        if os.path.getsize(local_p) != s1:
-                            logger.info(f"⏳ [跳过] 正在写入: {file_name}")
+                        
+                        # 🌟 增强稳定性检查：不仅查大小，还要查锁定
+                        # 迅雷下载完刚改名时，文件可能还没完全释放。
+                        # 这里强制连续检查 3 次，每次间隔 2 秒，确保万无一失
+                        is_stable = True
+                        current_size = -1
+                        for _ in range(3):
+                            try:
+                                s = os.path.getsize(local_p)
+                                if current_size != -1 and s != current_size:
+                                    is_stable = False
+                                    break
+                                current_size = s
+                                time.sleep(2)
+                            except:
+                                is_stable = False
+                                break
+                        
+                        if not is_stable:
+                            logger.info(f"⏳ [跳过] 文件不稳定(可能刚下载完): {file_name}")
                             continue
 
                         if i > 0: time.sleep(safe_int(config.get('file_interval'), 15))
@@ -254,7 +278,7 @@ def uploader_daemon(config):
                         remote_f = config.get('remote_folder', '')
                         if not remote_f or remote_f.strip() == "": remote_f = "."
                         remote_p = f"{remote_f}/{rel_p}" if remote_f != "." else rel_p
-                        size_mb = s1 / (1024*1024)
+                        size_mb = current_size / (1024*1024)
 
                         logger.info(f"▶ [开始] 上传: {file_name} ({size_mb:.1f} MB)")
 
@@ -276,7 +300,7 @@ def uploader_daemon(config):
                             except Exception as e:
                                 err_str = str(e)
                                 logger.info(f"⚠️ 发生错误，正在核实远程文件状态...")
-                                if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, s1):
+                                if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, current_size):
                                     logger.info(f"🎉 [捡漏] 远程文件已存在且完整，视为成功！")
                                     success = True
                                     break
@@ -343,7 +367,6 @@ def uploader_daemon(config):
                     is_idle_mode = True
                 
                 now = time.time()
-                # 检查开关
                 if config.get('enable_idle_email', False):
                     if (now - last_busy) > safe_int(config.get('idle_interval'), 1800):
                         if (now - last_idle) > safe_int(config.get('idle_interval'), 1800):
@@ -385,6 +408,8 @@ def save_settings():
         cfg['notify_min_size'] = safe_int(cfg.get('notify_min_size'), 1024)
         cfg['file_interval'] = safe_int(cfg.get('file_interval'), 15)
         
+        cfg['hf_token'] = str(cfg['hf_token']).strip()
+
         if save_config(cfg):
             return jsonify({"status": "success", "msg": "✅ 配置已保存！请点击启动"})
         else:
@@ -439,4 +464,4 @@ def stream_logs():
 if __name__ == '__main__':
     os.makedirs("/app/config", exist_ok=True)
     os.makedirs("/app/data", exist_ok=True)
-    app.run(host='0.0.0.0', port=7860)
+    app.run(host='0.0.0.0', port=7860, debug=False, use_reloader=False, threaded=True)
