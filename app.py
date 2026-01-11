@@ -1,4 +1,4 @@
-# app.py (V42.0 磐石·原子锁版)
+# app.py (V43.0 暴力清扫 & 补漏版)
 import os
 import sys
 import time
@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "delete_after_upload": True,
     "enable_hf_transfer": False,
     "enable_idle_email": False,
-    "stability_duration": 60  # 🌟 新增：静止校验时长(秒)
+    "stability_duration": 30 # 默认改为30秒，加快响应
 }
 
 uploader_thread = None
@@ -73,8 +73,7 @@ def load_config():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             config = DEFAULT_CONFIG.copy()
-            # 补全配置
-            if "stability_duration" not in config: config["stability_duration"] = 60
+            if "stability_duration" not in config: config["stability_duration"] = 30
             if "enable_hf_transfer" not in config: config["enable_hf_transfer"] = False
             if "enable_idle_email" not in config: config["enable_idle_email"] = False
             config.update(data)
@@ -148,63 +147,49 @@ def recursive_delete_empty(path):
 
 def check_remote_success(api, repo_id, repo_type, remote_path, local_size):
     try:
-        info = api.get_paths_info(repo_id=repo_id, repo_type=repo_type, paths=[remote_path])
+        info = api.get_paths_info(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            paths=[remote_path],
+        )
         if len(info) > 0:
             if info[0].size == local_size: return True
-    except: return False
+    except:
+        return False
     return False
 
-# 🌟 核心函数：文件夹稳定性校验 (原子锁)
+# 🌟 V40 核心：文件夹稳定性校验
 def check_folder_stability(folder_path, duration):
-    """
-    检查文件夹内所有文件在 duration 秒内是否发生变化。
-    返回: True(稳定), False(不稳定/正在写入)
-    """
-    logger.info(f"🛡️ [校验] 正在对 '{os.path.basename(folder_path)}' 进行 {duration}秒 静止测试...")
-    
+    logger.info(f"🛡️ [校验] 正在检查文件完整性，请等待 {duration}秒...")
     snapshot1 = {}
     try:
-        # 快照 1
         for root, _, files in os.walk(folder_path):
             for f in files:
                 p = os.path.join(root, f)
                 snapshot1[p] = {'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)}
         
-        # 强制等待
         time.sleep(duration)
         
-        # 快照 2
         snapshot2 = {}
         for root, _, files in os.walk(folder_path):
             for f in files:
                 p = os.path.join(root, f)
                 snapshot2[p] = {'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)}
         
-        # 对比
-        # 1. 文件数量必须一致
-        if len(snapshot1) != len(snapshot2):
-            logger.info(f"⏳ [跳过] 文件数量发生变化，迅雷正在创建新文件")
-            return False
-        
-        # 2. 每个文件的大小和修改时间必须一致
+        if len(snapshot1) != len(snapshot2): return False
         for p, meta in snapshot1.items():
-            if p not in snapshot2: return False # 文件消失了
-            if meta['size'] != snapshot2[p]['size']:
-                logger.info(f"⏳ [跳过] 文件正在写入: {os.path.basename(p)}")
+            if p not in snapshot2: return False
+            if meta['size'] != snapshot2[p]['size'] or meta['mtime'] != snapshot2[p]['mtime']:
+                logger.info(f"⏳ [写入中] 文件变化: {os.path.basename(p)}")
                 return False
-            if meta['mtime'] != snapshot2[p]['mtime']:
-                return False
-                
         return True
-    except Exception as e:
-        logger.warning(f"⚠️ 校验出错(可能文件被占用): {e}")
-        return False
+    except: return False
 
 def uploader_daemon(config):
     global is_running
     endpoint = config.get('hf_endpoint', 'https://hf-mirror.com')
     use_accel = config.get('enable_hf_transfer', False)
-    mode_str = "🚀 高速模式" if use_accel else "🐢 稳定模式 (HTTP)"
+    mode_str = "🚀 高速模式" if use_accel else "🐢 稳定模式"
     
     logger.info(f"🚀 服务启动 | 目标: {endpoint} | {mode_str}")
     
@@ -236,15 +221,49 @@ def uploader_daemon(config):
 
     while not stop_event.is_set():
         try:
+            # 🌟 0. 实时扫描反馈
+            logger.debug(f"🔍 正在扫描新文件...")
+            
             all_files = []
+            
+            # 1. 扫描与残留补漏
             for root, dirs, files in os.walk(DATA_DIR):
+                has_temp_file = False
+                for f in files: # 检查迅雷临时文件
+                    if f.endswith(('.xltd', '.tmp', '.download')): has_temp_file = True; break
+                if has_temp_file: continue
+                
                 for file in files:
                     if file.startswith('.') or file.endswith('.json'): continue
                     if file in JUNK_FILES: continue
+                    
                     full = os.path.join(root, file)
                     rel = os.path.relpath(full, DATA_DIR).replace("\\", "/")
-                    if rel not in uploaded_files:
-                        all_files.append((full, rel))
+                    
+                    # 🌟 V43 核心改进：即使在历史记录里，如果本地文件还在，也得处理！
+                    if rel in uploaded_files:
+                        # 检查是否真的上传了
+                        remote_f = config.get('remote_folder', '')
+                        if not remote_f or remote_f.strip() == "": remote_f = "."
+                        remote_p = f"{remote_f}/{rel}" if remote_f != "." else rel
+                        
+                        # 只有当开启了自动删除，且文件滞留在本地时，才进行“补刀”检查
+                        if config.get('delete_after_upload', True):
+                            logger.info(f"🧐 [补漏] 发现残留文件: {file}，正在核实云端...")
+                            if check_remote_success(api, config['repo_id'], config['repo_type'], remote_p, os.path.getsize(full)):
+                                logger.info(f"🗑️ [补刀] 云端已存在，执行删除: {file}")
+                                try:
+                                    os.remove(full)
+                                    recursive_delete_empty(os.path.dirname(full))
+                                except: pass
+                                continue # 删完了就跳过上传
+                            else:
+                                logger.info(f"⚠️ [重传] 云端缺失，重新加入队列: {file}")
+                                # 从历史记录移除，以便重新上传
+                                uploaded_files.discard(rel)
+                    
+                    # 加入待传列表
+                    all_files.append((full, rel))
 
             if all_files:
                 is_idle_mode = False
@@ -255,21 +274,19 @@ def uploader_daemon(config):
                     if folder not in tasks_by_folder: tasks_by_folder[folder] = []
                     tasks_by_folder[folder].append((full, rel))
 
-                logger.info(f"📦 扫描完成: 发现 {len(all_files)} 个待传文件")
+                logger.info(f"📦 发现 {len(all_files)} 个待处理文件")
                 failures_db = load_failures()
 
                 for folder_name, tasks in tasks_by_folder.items():
                     if stop_event.is_set(): break
                     
-                    # 🌟 核心：文件夹级原子锁校验
-                    # 获取该文件夹的绝对路径 (取第一个文件的目录)
+                    # 文件夹原子锁校验
                     folder_abs_path = os.path.dirname(tasks[0][0])
-                    stability_time = safe_int(config.get('stability_duration'), 60)
+                    stability_time = safe_int(config.get('stability_duration'), 30) # V43 默认30秒
                     
-                    # 对整个文件夹进行静止测试
                     if not check_folder_stability(folder_abs_path, stability_time):
-                        logger.info(f"⏳ [等待] 文件夹 '{folder_name}' 不稳定(下载中)，跳过本轮...")
-                        continue # 跳过这个文件夹，处理下一个
+                        logger.info(f"⏳ [等待] 文件夹 '{folder_name}' 正在写入，跳过...")
+                        continue 
 
                     logger.info(f"🔒 [锁定] 文件夹 '{folder_name}' 校验通过，开始上传...")
                     folder_success_count = 0
@@ -402,7 +419,7 @@ def save_settings():
         cfg['max_retries'] = safe_int(cfg.get('max_retries'), 3)
         cfg['notify_min_size'] = safe_int(cfg.get('notify_min_size'), 1024)
         cfg['file_interval'] = safe_int(cfg.get('file_interval'), 15)
-        cfg['stability_duration'] = safe_int(cfg.get('stability_duration'), 60) # 新增参数
+        cfg['stability_duration'] = safe_int(cfg.get('stability_duration'), 30)
         
         cfg['hf_token'] = str(cfg['hf_token']).strip()
 
